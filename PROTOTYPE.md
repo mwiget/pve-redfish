@@ -6,6 +6,10 @@ NICo-managed host (with a BlueField DPU passed through via PCI passthrough).
 
 > Standing it up on a real host? See **[RUNNING.md](RUNNING.md)** for the
 > turnkey install, DPU MAC map, NICo wiring, and on-host validation checklist.
+>
+> The authoritative wire contracts this emulation is built on (with
+> `NVIDIA/libredfish` file:line citations) are in
+> **[docs/libredfish-ami-contract.md](docs/libredfish-ami-contract.md)**.
 
 ## Why this is needed
 
