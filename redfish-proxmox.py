@@ -431,6 +431,156 @@ def reorder_boot_order(proxmox, vm_id, current_order, target):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Per-NIC boot order (AMI BootOptions / BootOrder emulation)
+#
+# NICo's libredfish AMI client drives host boot order by MAC, NOT by a generic
+# BootSourceOverrideTarget=Pxe:
+#
+#   set_boot_order_dpu_first(mac):
+#     1. GET  /Systems/{id}                    -> Boot.BootOrder[] + Boot.BootOptions
+#     2. GET  /Systems/{id}/BootOptions?$expand -> [{BootOptionReference, DisplayName}]
+#     3. pick the option whose DisplayName contains "HTTP" & "IPV4" & <MAC>
+#     4. move its BootOptionReference to the front of BootOrder
+#     5. PATCH /Systems/{id}/SD  (If-Match: *)  {"Boot": {"BootOrder": [...]}} -> 204
+#
+#   is_boot_order_setup(mac):  re-reads (1)+(2) and returns true iff the
+#     HTTP/IPv4/<MAC> option's reference is first in BootOrder.
+#
+# We model every Proxmox bootable device (netN / disks / cdrom) as a BootOption
+# whose BootOptionReference IS the Proxmox device key, so a BootOrder array maps
+# straight back to `boot: order=net0;scsi0;...`. The netN option's DisplayName
+# embeds its MAC so NICo's MAC match succeeds.
+# ---------------------------------------------------------------------------
+
+NET_MODELS = ("virtio", "e1000", "e1000e", "rtl8139", "vmxnet3")
+_DISK_TYPES = ("scsi", "sata", "virtio", "ide")
+_MAX_INDEX = 16  # netN / scsiN / ... ranges Proxmox actually allows
+
+
+def parse_net_mac(net_value):
+    """Extract the MAC from a Proxmox net device config string.
+
+    e.g. 'virtio=BC:24:11:AA:BB:CC,bridge=vmbr0,firewall=1' -> 'BC:24:11:AA:BB:CC'
+    """
+    first = net_value.split(",", 1)[0]
+    if "=" in first:
+        model, value = first.split("=", 1)
+        if model in NET_MODELS and value.count(":") == 5:
+            return value.upper()
+    # Fallback: any token that looks like a MAC
+    for part in net_value.split(","):
+        if "=" in part:
+            _, value = part.split("=", 1)
+            if value.count(":") == 5:
+                return value.upper()
+    return None
+
+
+def list_boot_devices(config):
+    """Ordered list of (dev_key, kind, mac) for all bootable VM devices.
+
+    kind is one of 'net' | 'disk' | 'cd'. NICs come first (boot interfaces),
+    then disks, then CD-ROMs.
+    """
+    devices = []
+    for i in range(_MAX_INDEX):
+        key = f"net{i}"
+        if key in config:
+            devices.append((key, "net", parse_net_mac(config[key])))
+    for dev_type in _DISK_TYPES:
+        for i in range(_MAX_INDEX):
+            key = f"{dev_type}{i}"
+            if key in config:
+                value = config[key]
+                if "media=cdrom" in value:
+                    devices.append((key, "cd", None))
+                elif value and "none" not in value.split(",")[0]:
+                    devices.append((key, "disk", None))
+    return devices
+
+
+def boot_option_display_name(dev_key, kind, mac):
+    """DisplayName carrying the tokens NICo matches on (HTTP, IPv4, MAC)."""
+    if kind == "net":
+        # NICo matches: display.upper() contains "HTTP" AND "IPV4" AND <MAC>.
+        return f"UEFI HTTP IPv4: {dev_key} ({mac})" if mac else f"UEFI PXE IPv4: {dev_key}"
+    if kind == "cd":
+        return f"UEFI CD/DVD: {dev_key}"
+    return f"UEFI Hard Drive: {dev_key}"
+
+
+def boot_option_object(vm_id, dev_key, kind, mac):
+    return {
+        "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions/{dev_key}",
+        "@odata.type": "#BootOption.v1_0_4.BootOption",
+        "Id": dev_key,
+        "Name": "Boot Option",
+        "BootOptionReference": dev_key,
+        "BootOptionEnabled": True,
+        "DisplayName": boot_option_display_name(dev_key, kind, mac),
+        "UefiDevicePath": f"VenHw(Proxmox,{dev_key})",
+    }
+
+
+def boot_options_members(vm_id, config):
+    return [boot_option_object(vm_id, k, kind, mac)
+            for (k, kind, mac) in list_boot_devices(config)]
+
+
+def current_boot_order(config):
+    """Boot.BootOrder as a list of references (Proxmox device keys)."""
+    boot = config.get("boot", "")
+    if boot.startswith("order="):
+        boot = boot[len("order="):]
+    refs = [r for r in boot.split(";") if r] if boot else []
+    if not refs:
+        # No explicit order configured: fall back to discovery order so the
+        # array is never empty (NICo reads BootOrder[0]).
+        refs = [k for (k, _, _) in list_boot_devices(config)]
+    return refs
+
+
+def boot_order_to_proxmox(refs):
+    """References from a BootOrder PATCH -> Proxmox 'boot' config value."""
+    ordered = [r for r in dict.fromkeys(refs) if r]
+    return f"order={';'.join(ordered)}" if ordered else ""
+
+
+def get_boot_options_collection(proxmox, vm_id):
+    """GET /redfish/v1/Systems/<vm_id>/BootOptions (members expanded).
+
+    libredfish fetches this with ?$expand=.($levels=1) and parses each Member
+    as a full BootOption, so we always return expanded objects.
+    """
+    try:
+        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        members = boot_options_members(vm_id, config)
+        return {
+            "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions",
+            "@odata.type": "#BootOptionCollection.BootOptionCollection",
+            "Name": "Boot Options Collection",
+            "Description": "Synthesized from Proxmox VM devices",
+            "Members": members,
+            "Members@odata.count": len(members),
+        }
+    except Exception as e:
+        return handle_proxmox_error("BootOptions retrieval", e, vm_id)
+
+
+def get_boot_option_detail(proxmox, vm_id, option_ref):
+    """GET /redfish/v1/Systems/<vm_id>/BootOptions/<ref>."""
+    try:
+        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        for (key, kind, mac) in list_boot_devices(config):
+            if key == option_ref:
+                return boot_option_object(vm_id, key, kind, mac)
+        return {"error": {"code": "Base.1.0.ResourceMissingAtURI",
+                          "message": f"BootOption {option_ref} not found"}}, 404
+    except Exception as e:
+        return handle_proxmox_error(f"BootOption retrieval for {option_ref}", e, vm_id)
+
+
 def get_bios(proxmox, vm_id):
     try:
         config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
@@ -1042,7 +1192,12 @@ def get_vm_status(proxmox, vm_id):
                 "BootSourceOverrideTarget": boot_target,
                 "BootSourceOverrideTarget@Redfish.AllowableValues": ["Pxe", "Cd", "Hdd"],
                 "BootSourceOverrideMode": boot_mode,
-                "BootSourceOverrideMode@Redfish.AllowableValues": ["UEFI", "Legacy"]
+                "BootSourceOverrideMode@Redfish.AllowableValues": ["UEFI", "Legacy"],
+                # Per-NIC boot order surface consumed by NICo's AMI client.
+                "BootOrder": current_boot_order(config),
+                "BootOptions": {
+                    "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions"
+                },
             },
             "Actions": {
                 "#ComputerSystem.Reset": {
@@ -1079,7 +1234,8 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
         headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
         logger.debug(f"GET Request: path={self.path}, headers=\n{headers_str}")
 
-        path = self.path.rstrip("/")
+        # Strip any query string (libredfish appends ?$expand=.($levels=1)).
+        path = self.path.split("?", 1)[0].rstrip("/")
         response = {}
         status_code = 200
         self.protocol_version = 'HTTP/1.1'
@@ -1098,6 +1254,11 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     "Id": "RootService",
                     "Name": "Redfish Root Service",
                     "RedfishVersion": "1.0.0",
+                    # Advertise an AMI BMC so NICo/libredfish selects its AMI
+                    # client, which implements per-NIC set_boot_order_dpu_first /
+                    # is_boot_order_setup (the generic client returns NotSupported).
+                    # See PROTOTYPE.md.
+                    "Vendor": "AMI",
                     "Systems": {"@odata.id": "/redfish/v1/Systems"}
                 }
             elif path == "/redfish/v1/Systems":
@@ -1127,6 +1288,17 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     if isinstance(response, tuple):
                         response, status_code = response
                 # END NEW CODE
+                elif len(parts) == 6 and parts[5] == "BootOptions":  # /redfish/v1/Systems/<vm_id>/BootOptions
+                    vm_id = int(parts[4])
+                    response = get_boot_options_collection(proxmox, vm_id)
+                    if isinstance(response, tuple):
+                        response, status_code = response
+                elif len(parts) == 7 and parts[5] == "BootOptions":  # /redfish/v1/Systems/<vm_id>/BootOptions/<ref>
+                    vm_id = int(parts[4])
+                    option_ref = parts[6]
+                    response = get_boot_option_detail(proxmox, vm_id, option_ref)
+                    if isinstance(response, tuple):
+                        response, status_code = response
                 elif len(parts) == 6 and parts[5] == "Processors":  # /redfish/v1/Systems/<vm_id>/Processors
                     vm_id = int(parts[4])
                     response = get_processor_collection(proxmox, vm_id)
@@ -1351,7 +1523,7 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
         headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
         logger.debug(f"PATCH Request: path={self.path}\nHeaders:\n{headers_str}\nPayload:\n{json.dumps(payload, indent=2)}")
 
-        path = self.path.rstrip("/")
+        path = self.path.split("?", 1)[0].rstrip("/")
         parts = path.split("/")
         response = {}
         status_code = 200
@@ -1382,7 +1554,35 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                 logger.debug(f"PATCH Response: path={self.path}, status={status_code}, body={json.dumps(response)}")
                 return
             
-            if len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
+            if len(parts) == 6 and parts[5] == "SD":  # /redfish/v1/Systems/<vm_id>/SD  (AMI @Redfish.Settings)
+                # NICo's AMI change_boot_order() PATCHes the Settings resource
+                # with {"Boot": {"BootOrder": [refs...]}} and If-Match: *, and
+                # expects 204 No Content. We translate the reference order back
+                # into Proxmox `boot: order=...`.
+                vm_id = parts[4]
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    boot = data.get("Boot", {})
+                    if "BootOrder" not in boot:
+                        status_code = 400
+                        response = {"error": {"code": "Base.1.0.InvalidRequest",
+                                              "message": "Boot.BootOrder required in PATCH to Settings resource"}}
+                    else:
+                        proxmox_boot = boot_order_to_proxmox(boot["BootOrder"])
+                        logger.debug(f"VM {vm_id}: applying BootOrder {boot['BootOrder']} -> '{proxmox_boot}'")
+                        proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.set(boot=proxmox_boot)
+                        # AMI patch_with_if_match expects 204 No Content (no body).
+                        self.send_response(204)
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        logger.debug(f"PATCH Response: path={self.path}, status=204 (BootOrder applied)")
+                        return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+                except Exception as e:
+                    response, status_code = handle_proxmox_error("Set BootOrder", e, vm_id)
+            elif len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
                 vm_id = parts[4]
                 try:
                     data = json.loads(post_data.decode('utf-8'))
