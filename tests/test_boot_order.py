@@ -7,6 +7,7 @@ is_boot_order_setup) against them, proving the wire contract closes without a
 live Proxmox or NICo. Run: python3 tests/test_boot_order.py
 """
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -187,6 +188,82 @@ def t_end_to_end_dpu_first():
     # Targeting the OTHER nic must select net1, not the DPU
     other_order = nico_set_boot_order_dpu_first(members2, boot_order2, OTHER_MAC)
     assert other_order[0] == "net1", other_order
+
+
+# --- DPU passthrough (hostpci) boot interface -------------------------------
+DPU_HOSTPCI_MAC = "AA:BB:CC:DD:EE:FF"
+
+
+def passthrough_config():
+    """A DPF-style host: BlueField DPU passed through as hostpci0 (no MAC in
+    qm config), plus a virtio mgmt NIC and a disk."""
+    return {
+        "name": "dpf-host",
+        "hostpci0": "0000:21:00,pcie=1,rombar=1",      # BlueField DPU PF
+        "net0": f"virtio={OTHER_MAC},bridge=vmbr0",     # mgmt nic
+        "scsi0": "local-zfs:vm-200-disk-0,size=64G",
+        "boot": "order=scsi0",
+    }
+
+
+def _with_dpu_map(vmid, value):
+    os.environ["REDFISH_DPU_MAC_MAP"] = json.dumps({str(vmid): value})
+
+
+def _clear_dpu_map():
+    os.environ.pop("REDFISH_DPU_MAC_MAP", None)
+    os.environ.pop("REDFISH_DPU_MAC_MAP_FILE", None)
+
+
+def t_dpu_mac_map_forms():
+    cfg = passthrough_config()
+    try:
+        _with_dpu_map(200, DPU_HOSTPCI_MAC)                       # bare string
+        assert rp.dpu_hostpci_macs(200, cfg) == {"hostpci0": DPU_HOSTPCI_MAC}
+        _with_dpu_map(200, {"device": "hostpci0", "mac": DPU_HOSTPCI_MAC.lower()})
+        assert rp.dpu_hostpci_macs(200, cfg) == {"hostpci0": DPU_HOSTPCI_MAC}
+        _with_dpu_map(200, {"hostpci0": DPU_HOSTPCI_MAC})         # dict of devices
+        assert rp.dpu_hostpci_macs(200, cfg) == {"hostpci0": DPU_HOSTPCI_MAC}
+        assert rp.dpu_hostpci_macs(999, cfg) == {}                # unknown vmid
+        _with_dpu_map(200, {"hostpci5": DPU_HOSTPCI_MAC})         # device not present
+        assert rp.dpu_hostpci_macs(200, cfg) == {}
+    finally:
+        _clear_dpu_map()
+
+
+def t_hostpci_first_in_boot_devices():
+    cfg = passthrough_config()
+    macs = {"hostpci0": DPU_HOSTPCI_MAC}
+    devs = rp.list_boot_devices(cfg, macs)
+    assert devs[0] == ("hostpci0", "hostpci", DPU_HOSTPCI_MAC), devs
+    name = rp.boot_option_display_name("hostpci0", "hostpci", DPU_HOSTPCI_MAC).upper()
+    assert "HTTP" in name and "IPV4" in name and DPU_HOSTPCI_MAC in name
+    # Without the map, hostpci0 is NOT a boot option (no MAC, can't HTTP-boot).
+    assert all(d[0] != "hostpci0" for d in rp.list_boot_devices(cfg))
+
+
+def t_end_to_end_dpu_first_hostpci():
+    """The real DPF case: order the passed-through DPU (hostpci0) first."""
+    cfg = passthrough_config()
+    try:
+        _with_dpu_map(200, DPU_HOSTPCI_MAC)
+        fake = FakeProxmox(cfg)
+        macs = rp.dpu_hostpci_macs(200, cfg)
+
+        members = rp.get_boot_options_collection(fake, 200)["Members"]
+        order = rp.current_boot_order(cfg, macs)
+        assert nico_is_boot_order_setup(members, order, DPU_HOSTPCI_MAC) is False
+
+        new_order = nico_set_boot_order_dpu_first(members, order, DPU_HOSTPCI_MAC)
+        proxmox_boot = rp.boot_order_to_proxmox(new_order)
+        assert proxmox_boot == "order=hostpci0;scsi0", proxmox_boot
+        fake.nodes("n").qemu(200).config.set(boot=proxmox_boot)
+
+        members2 = rp.get_boot_options_collection(fake, 200)["Members"]
+        order2 = rp.current_boot_order(cfg, rp.dpu_hostpci_macs(200, cfg))
+        assert nico_is_boot_order_setup(members2, order2, DPU_HOSTPCI_MAC) is True
+    finally:
+        _clear_dpu_map()
 
 
 def main():

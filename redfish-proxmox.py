@@ -447,15 +447,85 @@ def reorder_boot_order(proxmox, vm_id, current_order, target):
 #   is_boot_order_setup(mac):  re-reads (1)+(2) and returns true iff the
 #     HTTP/IPv4/<MAC> option's reference is first in BootOrder.
 #
-# We model every Proxmox bootable device (netN / disks / cdrom) as a BootOption
-# whose BootOptionReference IS the Proxmox device key, so a BootOrder array maps
-# straight back to `boot: order=net0;scsi0;...`. The netN option's DisplayName
-# embeds its MAC so NICo's MAC match succeeds.
+# We model every Proxmox bootable device (hostpciN / netN / disks / cdrom) as a
+# BootOption whose BootOptionReference IS the Proxmox device key, so a BootOrder
+# array maps straight back to `boot: order=hostpci0;net0;...`. The boot NIC's
+# DisplayName embeds its MAC so NICo's MAC match succeeds.
+#
+# DPU boot interface (PCI passthrough):
+#   In the DPF lab the host boots off the BlueField DPU, which is a `hostpciN`
+#   passthrough device -- NOT a virtio `netN` -- so its MAC is NOT in `qm config`.
+#   Modern Proxmox accepts `boot: order=hostpci0`, so the same `qm --boot order`
+#   lever works; we just need the DPU's PF MAC out-of-band to label its BootOption
+#   (NICo matches DisplayName on HTTP+IPv4+<MAC>). Supply it via REDFISH_DPU_MAC_MAP
+#   (JSON) or REDFISH_DPU_MAC_MAP_FILE. The passthrough device also needs rombar=1
+#   so OVMF loads the DPU's UEFI NIC driver and exposes an HTTP boot option.
 # ---------------------------------------------------------------------------
 
 NET_MODELS = ("virtio", "e1000", "e1000e", "rtl8139", "vmxnet3")
 _DISK_TYPES = ("scsi", "sata", "virtio", "ide")
 _MAX_INDEX = 16  # netN / scsiN / ... ranges Proxmox actually allows
+
+
+def _is_hostpci_key(key):
+    return key.startswith("hostpci") and key[len("hostpci"):].isdigit()
+
+
+def load_dpu_mac_map():
+    """Load the vmid -> DPU MAC mapping from env or file.
+
+    REDFISH_DPU_MAC_MAP      : JSON string
+    REDFISH_DPU_MAC_MAP_FILE : path to a JSON file (takes precedence)
+
+    The JSON is keyed by VM id (string). Each value may be:
+      "BC:24:11:AA:BB:CC"                    -> applies to the VM's first hostpciN
+      {"device": "hostpci1", "mac": "..."}   -> a specific passthrough device
+      {"hostpci0": "...", "hostpci1": "..."} -> several passthrough NICs
+    """
+    raw = os.getenv("REDFISH_DPU_MAC_MAP", "")
+    path = os.getenv("REDFISH_DPU_MAC_MAP_FILE", "")
+    if path and os.path.exists(path):
+        try:
+            with open(path) as f:
+                raw = f.read()
+        except OSError as e:
+            logger.error(f"Failed to read REDFISH_DPU_MAC_MAP_FILE {path}: {e}")
+            return {}
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid REDFISH_DPU_MAC_MAP JSON: {e}")
+        return {}
+
+
+def dpu_hostpci_macs(vm_id, config):
+    """Return {hostpci_key: MAC} for passthrough boot interfaces of this VM.
+
+    Only passthrough devices that (a) are present in the VM config and (b) have a
+    MAC in the map become bootable network options; unmapped hostpci devices
+    (GPUs, etc.) are ignored.
+    """
+    entry = load_dpu_mac_map().get(str(vm_id))
+    if not entry:
+        return {}
+    present = [k for k in config if _is_hostpci_key(k)]
+    result = {}
+    if isinstance(entry, str):
+        if present:
+            result[present[0]] = entry.upper()
+    elif isinstance(entry, dict):
+        if "mac" in entry:
+            dev = entry.get("device") or (present[0] if present else None)
+            if dev:
+                result[dev] = str(entry["mac"]).upper()
+        else:
+            for key, mac in entry.items():
+                if _is_hostpci_key(key):
+                    result[key] = str(mac).upper()
+    # Only keep devices actually present in the VM config.
+    return {k: v for k, v in result.items() if k in config}
 
 
 def parse_net_mac(net_value):
@@ -477,13 +547,20 @@ def parse_net_mac(net_value):
     return None
 
 
-def list_boot_devices(config):
+def list_boot_devices(config, hostpci_macs=None):
     """Ordered list of (dev_key, kind, mac) for all bootable VM devices.
 
-    kind is one of 'net' | 'disk' | 'cd'. NICs come first (boot interfaces),
-    then disks, then CD-ROMs.
+    kind is one of 'hostpci' | 'net' | 'disk' | 'cd'. The DPU passthrough boot
+    interface(s) come first, then virtio NICs, then disks, then CD-ROMs.
+    hostpci_macs maps {hostpci_key: MAC} for passthrough boot NICs.
     """
+    hostpci_macs = hostpci_macs or {}
     devices = []
+    # DPU / passthrough boot interfaces first (the host boots off the DPU).
+    for i in range(_MAX_INDEX):
+        key = f"hostpci{i}"
+        if key in config and key in hostpci_macs:
+            devices.append((key, "hostpci", hostpci_macs[key]))
     for i in range(_MAX_INDEX):
         key = f"net{i}"
         if key in config:
@@ -502,8 +579,9 @@ def list_boot_devices(config):
 
 def boot_option_display_name(dev_key, kind, mac):
     """DisplayName carrying the tokens NICo matches on (HTTP, IPv4, MAC)."""
-    if kind == "net":
+    if kind in ("net", "hostpci"):
         # NICo matches: display.upper() contains "HTTP" AND "IPV4" AND <MAC>.
+        # The DPU (hostpci) and virtio NICs share the HTTP-IPv4 boot form.
         return f"UEFI HTTP IPv4: {dev_key} ({mac})" if mac else f"UEFI PXE IPv4: {dev_key}"
     if kind == "cd":
         return f"UEFI CD/DVD: {dev_key}"
@@ -523,12 +601,12 @@ def boot_option_object(vm_id, dev_key, kind, mac):
     }
 
 
-def boot_options_members(vm_id, config):
+def boot_options_members(vm_id, config, hostpci_macs=None):
     return [boot_option_object(vm_id, k, kind, mac)
-            for (k, kind, mac) in list_boot_devices(config)]
+            for (k, kind, mac) in list_boot_devices(config, hostpci_macs)]
 
 
-def current_boot_order(config):
+def current_boot_order(config, hostpci_macs=None):
     """Boot.BootOrder as a list of references (Proxmox device keys)."""
     boot = config.get("boot", "")
     if boot.startswith("order="):
@@ -537,7 +615,7 @@ def current_boot_order(config):
     if not refs:
         # No explicit order configured: fall back to discovery order so the
         # array is never empty (NICo reads BootOrder[0]).
-        refs = [k for (k, _, _) in list_boot_devices(config)]
+        refs = [k for (k, _, _) in list_boot_devices(config, hostpci_macs)]
     return refs
 
 
@@ -555,7 +633,7 @@ def get_boot_options_collection(proxmox, vm_id):
     """
     try:
         config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
-        members = boot_options_members(vm_id, config)
+        members = boot_options_members(vm_id, config, dpu_hostpci_macs(vm_id, config))
         return {
             "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions",
             "@odata.type": "#BootOptionCollection.BootOptionCollection",
@@ -572,7 +650,7 @@ def get_boot_option_detail(proxmox, vm_id, option_ref):
     """GET /redfish/v1/Systems/<vm_id>/BootOptions/<ref>."""
     try:
         config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
-        for (key, kind, mac) in list_boot_devices(config):
+        for (key, kind, mac) in list_boot_devices(config, dpu_hostpci_macs(vm_id, config)):
             if key == option_ref:
                 return boot_option_object(vm_id, key, kind, mac)
         return {"error": {"code": "Base.1.0.ResourceMissingAtURI",
@@ -1194,7 +1272,7 @@ def get_vm_status(proxmox, vm_id):
                 "BootSourceOverrideMode": boot_mode,
                 "BootSourceOverrideMode@Redfish.AllowableValues": ["UEFI", "Legacy"],
                 # Per-NIC boot order surface consumed by NICo's AMI client.
-                "BootOrder": current_boot_order(config),
+                "BootOrder": current_boot_order(config, dpu_hostpci_macs(vm_id, config)),
                 "BootOptions": {
                     "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions"
                 },
