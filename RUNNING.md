@@ -8,6 +8,8 @@ open questions in [PROTOTYPE.md](PROTOTYPE.md).
 
 > The boot-order + AMI BIOS/Manager emulation is a **prototype**. Validate on a
 > throwaway host first. See the caveats at the end.
+>
+> Tracking PR: **[mwiget/pve-redfish#1](https://github.com/mwiget/pve-redfish/pull/1)**
 
 ---
 
