@@ -625,6 +625,29 @@ def boot_order_to_proxmox(refs):
     return f"order={';'.join(ordered)}" if ordered else ""
 
 
+def pick_boot_device_for_target(config, hostpci_macs, target):
+    """Map a Redfish BootSourceOverrideTarget to the device key to boot first.
+
+    Used by AMI set_boot_override()/boot_once(). Network targets prefer the DPU
+    passthrough NIC, then a virtio NIC. Returns None if no suitable device.
+    """
+    devs = list_boot_devices(config, hostpci_macs)
+    if target in ("Pxe", "UefiHttp"):
+        for want in ("hostpci", "net"):
+            for (key, kind, _mac) in devs:
+                if kind == want:
+                    return key
+    elif target == "Hdd":
+        for (key, kind, _mac) in devs:
+            if kind == "disk":
+                return key
+    elif target == "Cd":
+        for (key, kind, _mac) in devs:
+            if kind == "cd":
+                return key
+    return None
+
+
 def get_boot_options_collection(proxmox, vm_id):
     """GET /redfish/v1/Systems/<vm_id>/BootOptions (members expanded).
 
@@ -1903,6 +1926,43 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
                 except Exception as e:
                     response, status_code = handle_proxmox_error("BIOS update", e, vm_id)
+            elif (path.startswith("/redfish/v1/Systems/") and len(parts) == 5
+                  and self.headers.get("If-Match") is not None):
+                # AMI set_boot_override() / boot_once(): one-shot (or persistent)
+                # Boot override via PATCH /Systems/{id} with If-Match: *, body
+                # {"Boot":{"BootSourceOverrideTarget":..,"BootSourceOverrideEnabled":..}}.
+                # Expects 204. (The non-If-Match path below keeps sushy's 202+task.)
+                # Proxmox has no true one-shot UEFI boot, so we apply a best-effort
+                # persistent reorder; NICo sets explicit boot order separately.
+                vm_id = parts[4]
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    boot = data.get("Boot", {})
+                    target = boot.get("BootSourceOverrideTarget")
+                    enabled = boot.get("BootSourceOverrideEnabled", "Once")
+                    config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+                    macs = dpu_hostpci_macs(int(vm_id), config)
+                    dev = pick_boot_device_for_target(config, macs, target)
+                    if enabled == "Disabled":
+                        logger.debug(f"VM {vm_id}: boot override disabled (no-op)")
+                    elif dev:
+                        order = current_boot_order(config, macs)
+                        new_order = [dev] + [r for r in order if r != dev]
+                        proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.set(
+                            boot=boot_order_to_proxmox(new_order))
+                        logger.debug(f"VM {vm_id}: boot override {target} ({enabled}) -> {dev} first")
+                    else:
+                        logger.warning(f"VM {vm_id}: no device for boot override target {target}; acknowledging")
+                    self.send_response(204)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    logger.debug(f"PATCH Response: path={self.path}, status=204 (boot override)")
+                    return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+                except Exception as e:
+                    response, status_code = handle_proxmox_error("Boot override", e, vm_id)
             elif path.startswith("/redfish/v1/Systems/") and len(parts) == 5:
                 vm_id = path.split("/")[4]
                 logger.debug(f"Processing boot configuration for VM {vm_id}")

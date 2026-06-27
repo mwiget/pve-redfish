@@ -76,8 +76,8 @@ and asserts it is true after — and that targeting a different MAC selects the
 other NIC. Run:
 
 ```
-python3 tests/test_boot_order.py   # 13 unit tests (pure helpers + AMI algorithm replay)
-python3 tests/smoke_http.py        # 17 live-HTTP checks over a real socket
+python3 tests/test_boot_order.py   # 14 unit tests (pure helpers + AMI algorithm replay)
+python3 tests/smoke_http.py        # 19 live-HTTP checks over a real socket
 ```
 
 No Proxmox or NICo required (both stub `proxmoxer`).
@@ -103,8 +103,17 @@ loops converge on the first read:
 | `lockdown_bmc` | `PATCH /Managers/{id}/HostInterfaces/Self` (If-Match) | toggles `InterfaceEnabled` → `204` |
 | `bmc_reset` | `POST /Managers/{id}/Actions/Manager.Reset` | stubbed `200` |
 | `get_manager` / managers collection | `GET /Managers[/{id}]` | minimal Manager |
+| `boot_once` / `set_boot_override` | `PATCH /Systems/{id}` (If-Match) | best-effort reorder → `204` |
 
-`tests/smoke_http.py` exercises all of the above over a real socket (17 checks).
+`tests/smoke_http.py` exercises all of the above over a real socket (19 checks).
+
+The `boot_once` / `set_boot_override` PATCH is keyed on the `If-Match` header so
+NICo's AMI client gets `204`, while the existing sushy/ironic clients (no
+`If-Match`) keep their `202`+task path. Network targets (`Pxe`/`UefiHttp`) reorder
+the DPU (`hostpci`) NIC first, then a virtio NIC; `Hdd`/`Cd` pick a disk/cdrom.
+Proxmox has no true one-shot UEFI boot, so the reorder is applied persistently
+(NICo sets explicit boot order separately anyway); a faithful one-shot would use
+`virt-fw-vars` `BootNext` (same path as the hostpci efivars caveat above).
 
 ### Caveat: lockdown-ENABLE convergence
 
@@ -118,12 +127,12 @@ alone only toggles the HostInterface, so it cannot drive `lockdown_status` to
 per-host. The provisioning (unlocked) path — what gets the host *to* Ready — is fully
 coherent as-is.
 
-## Still open (NOT in this branch)
+## Coverage
 
-- **`boot_once` / `set_boot_override` (AMI)** → `PATCH /Systems/{id}` (If-Match) expecting
-  `204`. The existing `PATCH /Systems/{id}` returns `202`+task; add a `204` path when
-  called with `If-Match` so the DPU/host one-shot HTTP boot works. (Used on the DPU
-  install path, not strictly the host boot-order path.)
+The full libredfish AMI host-bring-up surface is now emulated: boot order
+(virtio + hostpci DPU), BIOS attributes, IPMI-over-LAN, lockdown, BMC manager,
+and the `boot_once`/`set_boot_override` one-shot override. What remains is
+environment validation on the real host (below) and the lockdown-ENABLE caveat.
 
 ## hostpci boot — resolved, with two caveats to verify on the host
 

@@ -327,6 +327,18 @@ def t_manager_and_ipmi_and_lockdown():
     assert nico_is_unlocked(rp.bios_state(303), hi["InterfaceEnabled"]) is True
 
 
+def t_pick_boot_device_for_target():
+    # DPF host: network target prefers the DPU passthrough NIC over virtio.
+    cfg = passthrough_config()
+    macs = {"hostpci0": DPU_HOSTPCI_MAC}
+    assert rp.pick_boot_device_for_target(cfg, macs, "UefiHttp") == "hostpci0"
+    assert rp.pick_boot_device_for_target(cfg, macs, "Pxe") == "hostpci0"
+    assert rp.pick_boot_device_for_target(cfg, macs, "Hdd") == "scsi0"
+    assert rp.pick_boot_device_for_target(cfg, macs, "Cd") is None  # no cdrom
+    # Without a DPU map, network target falls back to the virtio NIC.
+    assert rp.pick_boot_device_for_target(cfg, {}, "Pxe") == "net0"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
     failed = 0

@@ -176,6 +176,16 @@ def run_checks():
     check("qm boot order applied", VM_CONFIG["100"]["boot"] == "order=hostpci0;scsi0",
           VM_CONFIG["100"]["boot"])
 
+    # boot_once / set_boot_override (AMI): PATCH /Systems/{id} with If-Match -> 204
+    VM_CONFIG["100"]["boot"] = "order=scsi0"
+    st, _ = req("PATCH", "/redfish/v1/Systems/100",
+                {"Boot": {"BootSourceOverrideTarget": "UefiHttp",
+                          "BootSourceOverrideEnabled": "Once",
+                          "BootSourceOverrideMode": "UEFI"}})
+    check("boot_once -> 204", st == 204, st)
+    check("boot_once put DPU first", VM_CONFIG["100"]["boot"] == "order=hostpci0;scsi0",
+          VM_CONFIG["100"]["boot"])
+
     # POST Bios.ChangePassword + Manager.Reset -> 2xx
     st, _ = req("POST", "/redfish/v1/Systems/100/Bios/Actions/Bios.ChangePassword",
                 {"PasswordName": "SETUP001", "OldPassword": "", "NewPassword": "x"})
