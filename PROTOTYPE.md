@@ -4,6 +4,9 @@ This branch (`feat/per-nic-boot-order`) teaches the pve-redfish daemon to satisf
 NVIDIA **NICo**'s host boot-order sequencing when a Proxmox VM is used as a
 NICo-managed host (with a BlueField DPU passed through via PCI passthrough).
 
+> Standing it up on a real host? See **[RUNNING.md](RUNNING.md)** for the
+> turnkey install, DPU MAC map, NICo wiring, and on-host validation checklist.
+
 ## Why this is needed
 
 NICo provisions a host by PXE/HTTP-booting it off the **DPU NIC**. Its
