@@ -76,28 +76,54 @@ and asserts it is true after — and that targeting a different MAC selects the
 other NIC. Run:
 
 ```
-python3 tests/test_boot_order.py
+python3 tests/test_boot_order.py   # 13 unit tests (pure helpers + AMI algorithm replay)
+python3 tests/smoke_http.py        # 17 live-HTTP checks over a real socket
 ```
 
-No Proxmox or NICo required.
+No Proxmox or NICo required (both stub `proxmoxer`).
 
-## Open items before a full host bring-up (NOT in this branch)
+## AMI BIOS + Manager stubs (implemented)
 
 Advertising `Vendor: AMI` makes NICo use the AMI client for the *whole* host
-path, so a few more AMI ops fire beyond boot order. Boot order is the hard,
-novel piece and is done; these remain:
+path, so several attribute-based ops fire beyond boot order. These are now
+stubbed with a small in-memory store (`_BIOS_STATE` per VM, `_MGR_STATE` for the
+emulated BMC) **seeded with the exact values libredfish's AMI client expects**
+(from `ami.rs`: `serial_console_attrs` + `machine_setup_attrs`), so set/verify
+loops converge on the first read:
 
-1. **`is_bios_setup` (AMI)** calls `diff_bios_bmc_attr()` — GETs `/Systems/{id}/Bios`
-   and compares pending vs current attributes; empty diff ⇒ true. Needs a `/Bios`
-   (+ `/Bios/Settings`) stub that reports no pending diff when no BIOS profile is
-   configured for AMI in the NICo site config. (Confirm whether the site config
-   has an AMI profile; if not, `machine_setup` is a no-op and the diff is empty.)
-2. **`enable_ipmi_over_lan` / `is_ipmi_over_lan_enabled`** → `GET`/`PATCH
-   /Managers/{id}/NetworkProtocol` (If-Match) — needs a `/Managers` + NetworkProtocol stub.
-3. **`lockdown_bmc` (AMI)** → `PATCH /Managers/{id}/HostInterfaces/Self` — stub to `204`.
-4. **`boot_once` / `set_boot_override` (AMI)** → `PATCH /Systems/{id}` (If-Match) expecting
-   `204`. The existing `PATCH /Systems/{id}` returns `202`+task; add a `204` path when
-   called with `If-Match` so the DPU/host one-shot HTTP boot works.
+| AMI op | Endpoint | Behaviour |
+| --- | --- | --- |
+| `is_bios_setup` → `diff_bios_bmc_attr` | `GET /Systems/{id}/Bios` | `Attributes` seeded so the diff is empty ⇒ true |
+| `machine_setup` / `set_bios` | `PATCH /Systems/{id}/Bios/SD` (If-Match) | merges Attributes → `204` |
+| `change_uefi_password` | `POST /Systems/{id}/Bios/Actions/Bios.ChangePassword` | stubbed `200` |
+| `factory_reset_bios` | `POST /Systems/{id}/Bios/Actions/Bios.ResetBios` | re-seed → `200` |
+| `is_ipmi_over_lan_enabled` | `GET /Managers/{id}/NetworkProtocol` | `IPMI.ProtocolEnabled` (seeded true) |
+| `enable_ipmi_over_lan` | `PATCH /Managers/{id}/NetworkProtocol` (If-Match) | toggles state → `204` |
+| `lockdown_status` | `GET /Bios` (KCSACP/USB000) + `GET /Managers/{id}/HostInterfaces/Self` | seeded **unlocked** |
+| `lockdown_bmc` | `PATCH /Managers/{id}/HostInterfaces/Self` (If-Match) | toggles `InterfaceEnabled` → `204` |
+| `bmc_reset` | `POST /Managers/{id}/Actions/Manager.Reset` | stubbed `200` |
+| `get_manager` / managers collection | `GET /Managers[/{id}]` | minimal Manager |
+
+`tests/smoke_http.py` exercises all of the above over a real socket (17 checks).
+
+### Caveat: lockdown-ENABLE convergence
+
+`lockdown_status` computes *locked* from BIOS `KCSACP="Deny All"` + `USB000="Disabled"`
+**and** HostInterface `InterfaceEnabled=false`. The full AMI `lockdown()` sets all
+three (BIOS via `/Bios/SD`, which we merge), so it converges. But `lockdown_bmc()`
+alone only toggles the HostInterface, so it cannot drive `lockdown_status` to
+*locked*. If NICo's final `WaitingForLockdown` uses `lockdown_bmc` (not `lockdown`),
+**disable host-lockdown policy in the NICo site config** (that state then skips to
+`BomValidating`), or run **one shim instance per VM** so the manager state is truly
+per-host. The provisioning (unlocked) path — what gets the host *to* Ready — is fully
+coherent as-is.
+
+## Still open (NOT in this branch)
+
+- **`boot_once` / `set_boot_override` (AMI)** → `PATCH /Systems/{id}` (If-Match) expecting
+  `204`. The existing `PATCH /Systems/{id}` returns `202`+task; add a `204` path when
+  called with `If-Match` so the DPU/host one-shot HTTP boot works. (Used on the DPU
+  install path, not strictly the host boot-order path.)
 
 ## hostpci boot — resolved, with two caveats to verify on the host
 

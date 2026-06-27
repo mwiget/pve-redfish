@@ -659,31 +659,141 @@ def get_boot_option_detail(proxmox, vm_id, option_ref):
         return handle_proxmox_error(f"BootOption retrieval for {option_ref}", e, vm_id)
 
 
+# ---------------------------------------------------------------------------
+# AMI BIOS + Manager stubs (so NICo's host bring-up clears beyond boot order)
+#
+# Under Vendor: AMI, NICo's host state machine also exercises an attribute-based
+# BIOS model and the BMC manager:
+#
+#   is_bios_setup()        -> GET /Systems/{id}/Bios; diff Attributes vs the AMI
+#                             client's expected serial-console + machine-setup
+#                             attrs; empty diff => true.
+#   machine_setup()/set_bios() -> PATCH /Systems/{id}/Bios/SD {"Attributes":...} (If-Match: *) -> 204
+#   change_uefi_password() -> PATCH .../Bios password attr (SETUP001) -> tolerated
+#   enable_ipmi_over_lan() -> PATCH /Managers/{id}/NetworkProtocol {"IPMI":{"ProtocolEnabled":..}} -> 204
+#   is_ipmi_over_lan_enabled() -> GET  /Managers/{id}/NetworkProtocol
+#   lockdown_status()      -> GET /Systems/{id}/Bios (KCSACP, USB000) + GET
+#                             /Managers/{id}/HostInterfaces/Self (InterfaceEnabled)
+#   lockdown_bmc()         -> PATCH /Managers/{id}/HostInterfaces/Self -> 204
+#
+# We keep a small in-memory store seeded with the exact values libredfish's AMI
+# client expects (src ami.rs: serial_console_attrs + machine_setup_attrs), so the
+# very first is_bios_setup diff is empty and the BMC reports IPMI-on / unlocked
+# (provisioning-ready). PATCH merges into the store so any NICo-driven set/verify
+# loop converges. This state is emulation-only (per daemon process), not real VM
+# state. See PROTOTYPE.md for the lockdown-ENABLE caveat.
+# ---------------------------------------------------------------------------
+
+# Expected BIOS attributes for a non-Lenovo AMI BMC (libredfish ami.rs).
+_AMI_BIOS_SEED = {
+    # serial_console_attrs -> serial_console_status() fully enabled
+    "TER001": "Enabled", "TER010": "Enabled", "TER06B": "COM1",
+    "TER0021": "115200", "TER0020": "115200", "TER012": "VT100Plus",
+    "TER011": "VT-UTF8", "TER05D": "None",
+    # machine_setup_attrs -> is_bios_setup() empty diff
+    "VMXEN": "Enable", "PCIS007": "Enabled", "LEM0001": 3,
+    "NWSK000": "Enabled", "NWSK001": "Disabled", "NWSK006": "Enabled",
+    "NWSK002": "Disabled", "NWSK007": "Disabled", "FBO001": "UEFI",
+    "EndlessBoot": "Enabled",
+    # lockdown_status() readable attrs -- start unlocked for provisioning
+    "KCSACP": "Allow All", "USB000": "Enabled",
+}
+
+_BIOS_STATE = {}   # vm_id(str) -> attributes dict
+_MGR_STATE = {"ipmi_enabled": True, "host_iface_enabled": True}  # single emulated BMC
+
+
+def bios_state(vm_id):
+    return _BIOS_STATE.setdefault(str(vm_id), dict(_AMI_BIOS_SEED))
+
+
 def get_bios(proxmox, vm_id):
     try:
         config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
         firmware_type = config.get("bios", "seabios")
         firmware_mode = "BIOS" if firmware_type == "seabios" else "UEFI"
-
-        # Minimal BIOS info with link to SMBIOS details
-        response = {
+        attrs = dict(bios_state(vm_id))
+        attrs["BootOrder"] = config.get("boot", "")
+        return {
             "@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios",
-            "@odata.type": "#Bios.v1_0_0.Bios",
+            "@odata.type": "#Bios.v1_1_0.Bios",
             "Id": "Bios",
             "Name": "BIOS Settings",
-            "FirmwareMode": firmware_mode,  # From previous enhancement
-            "Attributes": {
-                "BootOrder": config.get("boot", "order=scsi0;ide2;net0")
+            "FirmwareMode": firmware_mode,
+            "Attributes": attrs,
+            # AMI pending settings live at /Bios/SD (hardcoded in libredfish).
+            "@Redfish.Settings": {
+                "@odata.type": "#Settings.v1_3_5.Settings",
+                "SettingsObject": {"@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SD"},
             },
-            "Links": {
-                "SMBIOS": {
-                    "@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SMBIOS"
-                }
-            }
+            "Links": {"SMBIOS": {"@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SMBIOS"}},
         }
-        return response
     except Exception as e:
         return handle_proxmox_error("BIOS retrieval", e, vm_id)
+
+
+def get_bios_sd(proxmox, vm_id):
+    """GET /Systems/<vm_id>/Bios/SD -- AMI pending settings resource.
+
+    We collapse pending into current (PATCH applies immediately), so the pending
+    view mirrors the live attribute store.
+    """
+    return {
+        "@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SD",
+        "@odata.type": "#Bios.v1_1_0.Bios",
+        "Id": "SD",
+        "Name": "BIOS Pending Settings",
+        "Attributes": dict(bios_state(vm_id)),
+    }
+
+
+def patch_bios_attributes(vm_id, attributes):
+    """Merge a PATCH of BIOS Attributes into the per-VM store."""
+    bios_state(vm_id).update(attributes)
+
+
+def get_managers_collection():
+    return {
+        "@odata.id": "/redfish/v1/Managers",
+        "@odata.type": "#ManagerCollection.ManagerCollection",
+        "Name": "Manager Collection",
+        "Members": [{"@odata.id": "/redfish/v1/Managers/BMC"}],
+        "Members@odata.count": 1,
+    }
+
+
+def get_manager(manager_id):
+    return {
+        "@odata.id": f"/redfish/v1/Managers/{manager_id}",
+        "@odata.type": "#Manager.v1_5_0.Manager",
+        "Id": manager_id,
+        "Name": "Manager",
+        "ManagerType": "BMC",
+        "Status": {"State": "Enabled", "Health": "OK"},
+        "PowerState": "On",
+        "NetworkProtocol": {"@odata.id": f"/redfish/v1/Managers/{manager_id}/NetworkProtocol"},
+    }
+
+
+def get_manager_network_protocol(manager_id):
+    return {
+        "@odata.id": f"/redfish/v1/Managers/{manager_id}/NetworkProtocol",
+        "@odata.type": "#ManagerNetworkProtocol.v1_5_0.ManagerNetworkProtocol",
+        "Id": "NetworkProtocol",
+        "Name": "Manager Network Protocol",
+        "IPMI": {"ProtocolEnabled": _MGR_STATE["ipmi_enabled"], "Port": 623},
+    }
+
+
+def get_host_interface_self(manager_id):
+    return {
+        "@odata.id": f"/redfish/v1/Managers/{manager_id}/HostInterfaces/Self",
+        "@odata.type": "#HostInterface.v1_3_0.HostInterface",
+        "Id": "Self",
+        "Name": "Host Interface",
+        "InterfaceEnabled": _MGR_STATE["host_iface_enabled"],
+        "Status": {"State": "Enabled", "Health": "OK"},
+    }
 
 
 def get_smbios_type1(proxmox, vm_id):
@@ -1337,7 +1447,8 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     # is_boot_order_setup (the generic client returns NotSupported).
                     # See PROTOTYPE.md.
                     "Vendor": "AMI",
-                    "Systems": {"@odata.id": "/redfish/v1/Systems"}
+                    "Systems": {"@odata.id": "/redfish/v1/Systems"},
+                    "Managers": {"@odata.id": "/redfish/v1/Managers"}
                 }
             elif path == "/redfish/v1/Systems":
                 try:
@@ -1363,6 +1474,11 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                 elif len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
                     vm_id = int(parts[4])
                     response = get_bios(proxmox, vm_id)
+                    if isinstance(response, tuple):
+                        response, status_code = response
+                elif len(parts) == 7 and parts[5] == "Bios" and parts[6] == "SD":  # /Bios/SD pending
+                    vm_id = int(parts[4])
+                    response = get_bios_sd(proxmox, vm_id)
                     if isinstance(response, tuple):
                         response, status_code = response
                 # END NEW CODE
@@ -1429,6 +1545,18 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     response = get_ethernet_interface_detail(proxmox, vm_id, interface_id)
                     if isinstance(response, tuple):
                         response, status_code = response
+                else:
+                    status_code = 404
+                    response = {"error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Resource not found: {path}"}}
+            elif path == "/redfish/v1/Managers":
+                response = get_managers_collection()
+            elif path.startswith("/redfish/v1/Managers/"):
+                if len(parts) == 5:  # /redfish/v1/Managers/<id>
+                    response = get_manager(parts[4])
+                elif len(parts) == 6 and parts[5] == "NetworkProtocol":
+                    response = get_manager_network_protocol(parts[4])
+                elif len(parts) == 7 and parts[5] == "HostInterfaces" and parts[6] == "Self":
+                    response = get_host_interface_self(parts[4])
                 else:
                     status_code = 404
                     response = {"error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Resource not found: {path}"}}
@@ -1564,6 +1692,22 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                         vm_id = path.split("/")[4]
                         config_data = data
                         response, status_code = update_vm_config(proxmox, int(vm_id), config_data)
+                    elif "/Bios/Actions/Bios.ChangePassword" in path:
+                        # AMI change_uefi_password() -> POST {PasswordName,OldPassword,NewPassword}.
+                        # Stubbed success (no real UEFI password on a VM).
+                        status_code = 200
+                        response = {"@odata.type": "#Message.v1_1_0.Message",
+                                    "Message": "UEFI/BIOS password updated"}
+                    elif "/Bios/Actions/Bios.ResetBios" in path:
+                        vm_id = path.split("/")[4]
+                        bios_state(vm_id).clear()
+                        bios_state(vm_id).update(_AMI_BIOS_SEED)
+                        status_code = 200
+                        response = {"@odata.type": "#Message.v1_1_0.Message",
+                                    "Message": f"BIOS reset for VM {vm_id}"}
+                    elif "/Actions/Manager.Reset" in path:
+                        status_code = 200
+                        response = {"@odata.type": "#Message.v1_1_0.Message", "Message": "Manager reset"}
                     else:
                         status_code = 404
                         response = {"error": {"code": "Base.1.0.GeneralError", "message": f"Resource not found: {path}"}}
@@ -1660,6 +1804,55 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
                 except Exception as e:
                     response, status_code = handle_proxmox_error("Set BootOrder", e, vm_id)
+            elif len(parts) == 7 and parts[5] == "Bios" and parts[6] == "SD":  # /Systems/<vm_id>/Bios/SD
+                # AMI set_bios() / change_bios_password() PATCH pending attributes
+                # here with If-Match: * and expect 204. We merge immediately.
+                vm_id = parts[4]
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    attributes = data.get("Attributes", {})
+                    if not isinstance(attributes, dict):
+                        status_code = 400
+                        response = {"error": {"code": "Base.1.0.InvalidRequest", "message": "Attributes object required"}}
+                    else:
+                        patch_bios_attributes(vm_id, attributes)
+                        logger.debug(f"VM {vm_id}: merged BIOS pending attrs {list(attributes)}")
+                        self.send_response(204)
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        logger.debug(f"PATCH Response: path={self.path}, status=204 (Bios/SD merged)")
+                        return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+            elif path.startswith("/redfish/v1/Managers/") and len(parts) == 6 and parts[5] == "NetworkProtocol":
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    ipmi = data.get("IPMI", {})
+                    if "ProtocolEnabled" in ipmi:
+                        _MGR_STATE["ipmi_enabled"] = bool(ipmi["ProtocolEnabled"])
+                    self.send_response(204)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    logger.debug(f"PATCH Response: path={self.path}, status=204 (ipmi={_MGR_STATE['ipmi_enabled']})")
+                    return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+            elif path.startswith("/redfish/v1/Managers/") and len(parts) == 7 \
+                    and parts[5] == "HostInterfaces" and parts[6] == "Self":
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    if "InterfaceEnabled" in data:
+                        _MGR_STATE["host_iface_enabled"] = bool(data["InterfaceEnabled"])
+                    self.send_response(204)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    logger.debug(f"PATCH Response: path={self.path}, status=204 (host_iface={_MGR_STATE['host_iface_enabled']})")
+                    return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
             elif len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
                 vm_id = parts[4]
                 try:

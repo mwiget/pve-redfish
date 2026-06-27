@@ -266,6 +266,67 @@ def t_end_to_end_dpu_first_hostpci():
         _clear_dpu_map()
 
 
+# --- AMI BIOS + Manager stubs ------------------------------------------------
+# Expected attribute sets from libredfish ami.rs (non-Lenovo AMI).
+AMI_SERIAL_CONSOLE = {
+    "TER001": "Enabled", "TER010": "Enabled", "TER06B": "COM1", "TER0021": "115200",
+    "TER0020": "115200", "TER012": "VT100Plus", "TER011": "VT-UTF8", "TER05D": "None",
+}
+AMI_MACHINE_SETUP = {
+    "VMXEN": "Enable", "PCIS007": "Enabled", "LEM0001": 3, "NWSK000": "Enabled",
+    "NWSK001": "Disabled", "NWSK006": "Enabled", "NWSK002": "Disabled",
+    "NWSK007": "Disabled", "FBO001": "UEFI", "EndlessBoot": "Enabled",
+}
+
+
+def nico_bios_diff(attrs):
+    """Mirror of ami.rs diff_bios_bmc_attr: serial console + machine setup."""
+    expected = {**AMI_SERIAL_CONSOLE, **AMI_MACHINE_SETUP}
+    return [(k, v, attrs.get(k)) for k, v in expected.items()
+            if str(attrs.get(k)) != str(v)]
+
+
+def nico_is_unlocked(bios_attrs, host_iface_enabled):
+    """Mirror of ami.rs lockdown_status is_unlocked predicate."""
+    return (bios_attrs.get("KCSACP") == "Allow All"
+            and bios_attrs.get("USB000") == "Enabled"
+            and host_iface_enabled)
+
+
+def t_bios_seed_yields_empty_diff():
+    # The seeded BIOS attrs must satisfy NICo's is_bios_setup on the first read.
+    attrs = rp.bios_state(300)
+    assert nico_bios_diff(attrs) == [], nico_bios_diff(attrs)
+
+
+def t_get_bios_exposes_settings_and_attrs():
+    cfg = {"name": "h", "bios": "ovmf", "boot": "order=hostpci0", "hostpci0": "0000:21:00"}
+    bios = rp.get_bios(FakeProxmox(cfg), 301)
+    assert nico_bios_diff(bios["Attributes"]) == []
+    assert bios["Attributes"]["BootOrder"] == "order=hostpci0"
+    assert bios["@Redfish.Settings"]["SettingsObject"]["@odata.id"].endswith("/Bios/SD")
+
+
+def t_patch_bios_merges_and_converges():
+    vmid = 302
+    # Simulate a NICo set/verify loop: wipe an expected attr, PATCH it back.
+    rp.bios_state(vmid)["NWSK006"] = "Disabled"          # drift
+    assert nico_bios_diff(rp.bios_state(vmid)) != []
+    rp.patch_bios_attributes(vmid, {"NWSK006": "Enabled"})  # NICo's set_bios -> /Bios/SD
+    assert nico_bios_diff(rp.bios_state(vmid)) == []
+
+
+def t_manager_and_ipmi_and_lockdown():
+    coll = rp.get_managers_collection()
+    assert coll["Members@odata.count"] == 1
+    mgr_id = coll["Members"][0]["@odata.id"].rsplit("/", 1)[-1]
+    np = rp.get_manager_network_protocol(mgr_id)
+    assert np["IPMI"]["ProtocolEnabled"] is True          # is_ipmi_over_lan_enabled -> true
+    hi = rp.get_host_interface_self(mgr_id)
+    # lockdown_status reads bios (KCSACP/USB000) + host interface -> unlocked
+    assert nico_is_unlocked(rp.bios_state(303), hi["InterfaceEnabled"]) is True
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("t_")]
     failed = 0
