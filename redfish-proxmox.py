@@ -431,31 +431,392 @@ def reorder_boot_order(proxmox, vm_id, current_order, target):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Per-NIC boot order (AMI BootOptions / BootOrder emulation)
+#
+# NICo's libredfish AMI client drives host boot order by MAC, NOT by a generic
+# BootSourceOverrideTarget=Pxe:
+#
+#   set_boot_order_dpu_first(mac):
+#     1. GET  /Systems/{id}                    -> Boot.BootOrder[] + Boot.BootOptions
+#     2. GET  /Systems/{id}/BootOptions?$expand -> [{BootOptionReference, DisplayName}]
+#     3. pick the option whose DisplayName contains "HTTP" & "IPV4" & <MAC>
+#     4. move its BootOptionReference to the front of BootOrder
+#     5. PATCH /Systems/{id}/SD  (If-Match: *)  {"Boot": {"BootOrder": [...]}} -> 204
+#
+#   is_boot_order_setup(mac):  re-reads (1)+(2) and returns true iff the
+#     HTTP/IPv4/<MAC> option's reference is first in BootOrder.
+#
+# We model every Proxmox bootable device (hostpciN / netN / disks / cdrom) as a
+# BootOption whose BootOptionReference IS the Proxmox device key, so a BootOrder
+# array maps straight back to `boot: order=hostpci0;net0;...`. The boot NIC's
+# DisplayName embeds its MAC so NICo's MAC match succeeds.
+#
+# DPU boot interface (PCI passthrough):
+#   In the DPF lab the host boots off the BlueField DPU, which is a `hostpciN`
+#   passthrough device -- NOT a virtio `netN` -- so its MAC is NOT in `qm config`.
+#   Modern Proxmox accepts `boot: order=hostpci0`, so the same `qm --boot order`
+#   lever works; we just need the DPU's PF MAC out-of-band to label its BootOption
+#   (NICo matches DisplayName on HTTP+IPv4+<MAC>). Supply it via REDFISH_DPU_MAC_MAP
+#   (JSON) or REDFISH_DPU_MAC_MAP_FILE. The passthrough device also needs rombar=1
+#   so OVMF loads the DPU's UEFI NIC driver and exposes an HTTP boot option.
+# ---------------------------------------------------------------------------
+
+NET_MODELS = ("virtio", "e1000", "e1000e", "rtl8139", "vmxnet3")
+_DISK_TYPES = ("scsi", "sata", "virtio", "ide")
+_MAX_INDEX = 16  # netN / scsiN / ... ranges Proxmox actually allows
+
+
+def _is_hostpci_key(key):
+    return key.startswith("hostpci") and key[len("hostpci"):].isdigit()
+
+
+def load_dpu_mac_map():
+    """Load the vmid -> DPU MAC mapping from env or file.
+
+    REDFISH_DPU_MAC_MAP      : JSON string
+    REDFISH_DPU_MAC_MAP_FILE : path to a JSON file (takes precedence)
+
+    The JSON is keyed by VM id (string). Each value may be:
+      "BC:24:11:AA:BB:CC"                    -> applies to the VM's first hostpciN
+      {"device": "hostpci1", "mac": "..."}   -> a specific passthrough device
+      {"hostpci0": "...", "hostpci1": "..."} -> several passthrough NICs
+    """
+    raw = os.getenv("REDFISH_DPU_MAC_MAP", "")
+    path = os.getenv("REDFISH_DPU_MAC_MAP_FILE", "")
+    if path and os.path.exists(path):
+        try:
+            with open(path) as f:
+                raw = f.read()
+        except OSError as e:
+            logger.error(f"Failed to read REDFISH_DPU_MAC_MAP_FILE {path}: {e}")
+            return {}
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid REDFISH_DPU_MAC_MAP JSON: {e}")
+        return {}
+
+
+def dpu_hostpci_macs(vm_id, config):
+    """Return {hostpci_key: MAC} for passthrough boot interfaces of this VM.
+
+    Only passthrough devices that (a) are present in the VM config and (b) have a
+    MAC in the map become bootable network options; unmapped hostpci devices
+    (GPUs, etc.) are ignored.
+    """
+    entry = load_dpu_mac_map().get(str(vm_id))
+    if not entry:
+        return {}
+    present = [k for k in config if _is_hostpci_key(k)]
+    result = {}
+    if isinstance(entry, str):
+        if present:
+            result[present[0]] = entry.upper()
+    elif isinstance(entry, dict):
+        if "mac" in entry:
+            dev = entry.get("device") or (present[0] if present else None)
+            if dev:
+                result[dev] = str(entry["mac"]).upper()
+        else:
+            for key, mac in entry.items():
+                if _is_hostpci_key(key):
+                    result[key] = str(mac).upper()
+    # Only keep devices actually present in the VM config.
+    return {k: v for k, v in result.items() if k in config}
+
+
+def parse_net_mac(net_value):
+    """Extract the MAC from a Proxmox net device config string.
+
+    e.g. 'virtio=BC:24:11:AA:BB:CC,bridge=vmbr0,firewall=1' -> 'BC:24:11:AA:BB:CC'
+    """
+    first = net_value.split(",", 1)[0]
+    if "=" in first:
+        model, value = first.split("=", 1)
+        if model in NET_MODELS and value.count(":") == 5:
+            return value.upper()
+    # Fallback: any token that looks like a MAC
+    for part in net_value.split(","):
+        if "=" in part:
+            _, value = part.split("=", 1)
+            if value.count(":") == 5:
+                return value.upper()
+    return None
+
+
+def list_boot_devices(config, hostpci_macs=None):
+    """Ordered list of (dev_key, kind, mac) for all bootable VM devices.
+
+    kind is one of 'hostpci' | 'net' | 'disk' | 'cd'. The DPU passthrough boot
+    interface(s) come first, then virtio NICs, then disks, then CD-ROMs.
+    hostpci_macs maps {hostpci_key: MAC} for passthrough boot NICs.
+    """
+    hostpci_macs = hostpci_macs or {}
+    devices = []
+    # DPU / passthrough boot interfaces first (the host boots off the DPU).
+    for i in range(_MAX_INDEX):
+        key = f"hostpci{i}"
+        if key in config and key in hostpci_macs:
+            devices.append((key, "hostpci", hostpci_macs[key]))
+    for i in range(_MAX_INDEX):
+        key = f"net{i}"
+        if key in config:
+            devices.append((key, "net", parse_net_mac(config[key])))
+    for dev_type in _DISK_TYPES:
+        for i in range(_MAX_INDEX):
+            key = f"{dev_type}{i}"
+            if key in config:
+                value = config[key]
+                if "media=cdrom" in value:
+                    devices.append((key, "cd", None))
+                elif value and "none" not in value.split(",")[0]:
+                    devices.append((key, "disk", None))
+    return devices
+
+
+def boot_option_display_name(dev_key, kind, mac):
+    """DisplayName carrying the tokens NICo matches on (HTTP, IPv4, MAC)."""
+    if kind in ("net", "hostpci"):
+        # NICo matches: display.upper() contains "HTTP" AND "IPV4" AND <MAC>.
+        # The DPU (hostpci) and virtio NICs share the HTTP-IPv4 boot form.
+        return f"UEFI HTTP IPv4: {dev_key} ({mac})" if mac else f"UEFI PXE IPv4: {dev_key}"
+    if kind == "cd":
+        return f"UEFI CD/DVD: {dev_key}"
+    return f"UEFI Hard Drive: {dev_key}"
+
+
+def boot_option_object(vm_id, dev_key, kind, mac):
+    return {
+        "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions/{dev_key}",
+        "@odata.type": "#BootOption.v1_0_4.BootOption",
+        "Id": dev_key,
+        "Name": "Boot Option",
+        "BootOptionReference": dev_key,
+        "BootOptionEnabled": True,
+        "DisplayName": boot_option_display_name(dev_key, kind, mac),
+        "UefiDevicePath": f"VenHw(Proxmox,{dev_key})",
+    }
+
+
+def boot_options_members(vm_id, config, hostpci_macs=None):
+    return [boot_option_object(vm_id, k, kind, mac)
+            for (k, kind, mac) in list_boot_devices(config, hostpci_macs)]
+
+
+def current_boot_order(config, hostpci_macs=None):
+    """Boot.BootOrder as a list of references (Proxmox device keys)."""
+    boot = config.get("boot", "")
+    if boot.startswith("order="):
+        boot = boot[len("order="):]
+    refs = [r for r in boot.split(";") if r] if boot else []
+    if not refs:
+        # No explicit order configured: fall back to discovery order so the
+        # array is never empty (NICo reads BootOrder[0]).
+        refs = [k for (k, _, _) in list_boot_devices(config, hostpci_macs)]
+    return refs
+
+
+def boot_order_to_proxmox(refs):
+    """References from a BootOrder PATCH -> Proxmox 'boot' config value."""
+    ordered = [r for r in dict.fromkeys(refs) if r]
+    return f"order={';'.join(ordered)}" if ordered else ""
+
+
+def pick_boot_device_for_target(config, hostpci_macs, target):
+    """Map a Redfish BootSourceOverrideTarget to the device key to boot first.
+
+    Used by AMI set_boot_override()/boot_once(). Network targets prefer the DPU
+    passthrough NIC, then a virtio NIC. Returns None if no suitable device.
+    """
+    devs = list_boot_devices(config, hostpci_macs)
+    if target in ("Pxe", "UefiHttp"):
+        for want in ("hostpci", "net"):
+            for (key, kind, _mac) in devs:
+                if kind == want:
+                    return key
+    elif target == "Hdd":
+        for (key, kind, _mac) in devs:
+            if kind == "disk":
+                return key
+    elif target == "Cd":
+        for (key, kind, _mac) in devs:
+            if kind == "cd":
+                return key
+    return None
+
+
+def get_boot_options_collection(proxmox, vm_id):
+    """GET /redfish/v1/Systems/<vm_id>/BootOptions (members expanded).
+
+    libredfish fetches this with ?$expand=.($levels=1) and parses each Member
+    as a full BootOption, so we always return expanded objects.
+    """
+    try:
+        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        members = boot_options_members(vm_id, config, dpu_hostpci_macs(vm_id, config))
+        return {
+            "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions",
+            "@odata.type": "#BootOptionCollection.BootOptionCollection",
+            "Name": "Boot Options Collection",
+            "Description": "Synthesized from Proxmox VM devices",
+            "Members": members,
+            "Members@odata.count": len(members),
+        }
+    except Exception as e:
+        return handle_proxmox_error("BootOptions retrieval", e, vm_id)
+
+
+def get_boot_option_detail(proxmox, vm_id, option_ref):
+    """GET /redfish/v1/Systems/<vm_id>/BootOptions/<ref>."""
+    try:
+        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        for (key, kind, mac) in list_boot_devices(config, dpu_hostpci_macs(vm_id, config)):
+            if key == option_ref:
+                return boot_option_object(vm_id, key, kind, mac)
+        return {"error": {"code": "Base.1.0.ResourceMissingAtURI",
+                          "message": f"BootOption {option_ref} not found"}}, 404
+    except Exception as e:
+        return handle_proxmox_error(f"BootOption retrieval for {option_ref}", e, vm_id)
+
+
+# ---------------------------------------------------------------------------
+# AMI BIOS + Manager stubs (so NICo's host bring-up clears beyond boot order)
+#
+# Under Vendor: AMI, NICo's host state machine also exercises an attribute-based
+# BIOS model and the BMC manager:
+#
+#   is_bios_setup()        -> GET /Systems/{id}/Bios; diff Attributes vs the AMI
+#                             client's expected serial-console + machine-setup
+#                             attrs; empty diff => true.
+#   machine_setup()/set_bios() -> PATCH /Systems/{id}/Bios/SD {"Attributes":...} (If-Match: *) -> 204
+#   change_uefi_password() -> PATCH .../Bios password attr (SETUP001) -> tolerated
+#   enable_ipmi_over_lan() -> PATCH /Managers/{id}/NetworkProtocol {"IPMI":{"ProtocolEnabled":..}} -> 204
+#   is_ipmi_over_lan_enabled() -> GET  /Managers/{id}/NetworkProtocol
+#   lockdown_status()      -> GET /Systems/{id}/Bios (KCSACP, USB000) + GET
+#                             /Managers/{id}/HostInterfaces/Self (InterfaceEnabled)
+#   lockdown_bmc()         -> PATCH /Managers/{id}/HostInterfaces/Self -> 204
+#
+# We keep a small in-memory store seeded with the exact values libredfish's AMI
+# client expects (src ami.rs: serial_console_attrs + machine_setup_attrs), so the
+# very first is_bios_setup diff is empty and the BMC reports IPMI-on / unlocked
+# (provisioning-ready). PATCH merges into the store so any NICo-driven set/verify
+# loop converges. This state is emulation-only (per daemon process), not real VM
+# state. See PROTOTYPE.md for the lockdown-ENABLE caveat.
+# ---------------------------------------------------------------------------
+
+# Expected BIOS attributes for a non-Lenovo AMI BMC (libredfish ami.rs).
+_AMI_BIOS_SEED = {
+    # serial_console_attrs -> serial_console_status() fully enabled
+    "TER001": "Enabled", "TER010": "Enabled", "TER06B": "COM1",
+    "TER0021": "115200", "TER0020": "115200", "TER012": "VT100Plus",
+    "TER011": "VT-UTF8", "TER05D": "None",
+    # machine_setup_attrs -> is_bios_setup() empty diff
+    "VMXEN": "Enable", "PCIS007": "Enabled", "LEM0001": 3,
+    "NWSK000": "Enabled", "NWSK001": "Disabled", "NWSK006": "Enabled",
+    "NWSK002": "Disabled", "NWSK007": "Disabled", "FBO001": "UEFI",
+    "EndlessBoot": "Enabled",
+    # lockdown_status() readable attrs -- start unlocked for provisioning
+    "KCSACP": "Allow All", "USB000": "Enabled",
+}
+
+_BIOS_STATE = {}   # vm_id(str) -> attributes dict
+_MGR_STATE = {"ipmi_enabled": True, "host_iface_enabled": True}  # single emulated BMC
+
+
+def bios_state(vm_id):
+    return _BIOS_STATE.setdefault(str(vm_id), dict(_AMI_BIOS_SEED))
+
+
 def get_bios(proxmox, vm_id):
     try:
         config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
         firmware_type = config.get("bios", "seabios")
         firmware_mode = "BIOS" if firmware_type == "seabios" else "UEFI"
-
-        # Minimal BIOS info with link to SMBIOS details
-        response = {
+        attrs = dict(bios_state(vm_id))
+        attrs["BootOrder"] = config.get("boot", "")
+        return {
             "@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios",
-            "@odata.type": "#Bios.v1_0_0.Bios",
+            "@odata.type": "#Bios.v1_1_0.Bios",
             "Id": "Bios",
             "Name": "BIOS Settings",
-            "FirmwareMode": firmware_mode,  # From previous enhancement
-            "Attributes": {
-                "BootOrder": config.get("boot", "order=scsi0;ide2;net0")
+            "FirmwareMode": firmware_mode,
+            "Attributes": attrs,
+            # AMI pending settings live at /Bios/SD (hardcoded in libredfish).
+            "@Redfish.Settings": {
+                "@odata.type": "#Settings.v1_3_5.Settings",
+                "SettingsObject": {"@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SD"},
             },
-            "Links": {
-                "SMBIOS": {
-                    "@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SMBIOS"
-                }
-            }
+            "Links": {"SMBIOS": {"@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SMBIOS"}},
         }
-        return response
     except Exception as e:
         return handle_proxmox_error("BIOS retrieval", e, vm_id)
+
+
+def get_bios_sd(proxmox, vm_id):
+    """GET /Systems/<vm_id>/Bios/SD -- AMI pending settings resource.
+
+    We collapse pending into current (PATCH applies immediately), so the pending
+    view mirrors the live attribute store.
+    """
+    return {
+        "@odata.id": f"/redfish/v1/Systems/{vm_id}/Bios/SD",
+        "@odata.type": "#Bios.v1_1_0.Bios",
+        "Id": "SD",
+        "Name": "BIOS Pending Settings",
+        "Attributes": dict(bios_state(vm_id)),
+    }
+
+
+def patch_bios_attributes(vm_id, attributes):
+    """Merge a PATCH of BIOS Attributes into the per-VM store."""
+    bios_state(vm_id).update(attributes)
+
+
+def get_managers_collection():
+    return {
+        "@odata.id": "/redfish/v1/Managers",
+        "@odata.type": "#ManagerCollection.ManagerCollection",
+        "Name": "Manager Collection",
+        "Members": [{"@odata.id": "/redfish/v1/Managers/BMC"}],
+        "Members@odata.count": 1,
+    }
+
+
+def get_manager(manager_id):
+    return {
+        "@odata.id": f"/redfish/v1/Managers/{manager_id}",
+        "@odata.type": "#Manager.v1_5_0.Manager",
+        "Id": manager_id,
+        "Name": "Manager",
+        "ManagerType": "BMC",
+        "Status": {"State": "Enabled", "Health": "OK"},
+        "PowerState": "On",
+        "NetworkProtocol": {"@odata.id": f"/redfish/v1/Managers/{manager_id}/NetworkProtocol"},
+    }
+
+
+def get_manager_network_protocol(manager_id):
+    return {
+        "@odata.id": f"/redfish/v1/Managers/{manager_id}/NetworkProtocol",
+        "@odata.type": "#ManagerNetworkProtocol.v1_5_0.ManagerNetworkProtocol",
+        "Id": "NetworkProtocol",
+        "Name": "Manager Network Protocol",
+        "IPMI": {"ProtocolEnabled": _MGR_STATE["ipmi_enabled"], "Port": 623},
+    }
+
+
+def get_host_interface_self(manager_id):
+    return {
+        "@odata.id": f"/redfish/v1/Managers/{manager_id}/HostInterfaces/Self",
+        "@odata.type": "#HostInterface.v1_3_0.HostInterface",
+        "Id": "Self",
+        "Name": "Host Interface",
+        "InterfaceEnabled": _MGR_STATE["host_iface_enabled"],
+        "Status": {"State": "Enabled", "Health": "OK"},
+    }
 
 
 def get_smbios_type1(proxmox, vm_id):
@@ -1042,7 +1403,12 @@ def get_vm_status(proxmox, vm_id):
                 "BootSourceOverrideTarget": boot_target,
                 "BootSourceOverrideTarget@Redfish.AllowableValues": ["Pxe", "Cd", "Hdd"],
                 "BootSourceOverrideMode": boot_mode,
-                "BootSourceOverrideMode@Redfish.AllowableValues": ["UEFI", "Legacy"]
+                "BootSourceOverrideMode@Redfish.AllowableValues": ["UEFI", "Legacy"],
+                # Per-NIC boot order surface consumed by NICo's AMI client.
+                "BootOrder": current_boot_order(config, dpu_hostpci_macs(vm_id, config)),
+                "BootOptions": {
+                    "@odata.id": f"/redfish/v1/Systems/{vm_id}/BootOptions"
+                },
             },
             "Actions": {
                 "#ComputerSystem.Reset": {
@@ -1079,7 +1445,8 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
         headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
         logger.debug(f"GET Request: path={self.path}, headers=\n{headers_str}")
 
-        path = self.path.rstrip("/")
+        # Strip any query string (libredfish appends ?$expand=.($levels=1)).
+        path = self.path.split("?", 1)[0].rstrip("/")
         response = {}
         status_code = 200
         self.protocol_version = 'HTTP/1.1'
@@ -1098,7 +1465,13 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     "Id": "RootService",
                     "Name": "Redfish Root Service",
                     "RedfishVersion": "1.0.0",
-                    "Systems": {"@odata.id": "/redfish/v1/Systems"}
+                    # Advertise an AMI BMC so NICo/libredfish selects its AMI
+                    # client, which implements per-NIC set_boot_order_dpu_first /
+                    # is_boot_order_setup (the generic client returns NotSupported).
+                    # See PROTOTYPE.md.
+                    "Vendor": "AMI",
+                    "Systems": {"@odata.id": "/redfish/v1/Systems"},
+                    "Managers": {"@odata.id": "/redfish/v1/Managers"}
                 }
             elif path == "/redfish/v1/Systems":
                 try:
@@ -1126,7 +1499,23 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     response = get_bios(proxmox, vm_id)
                     if isinstance(response, tuple):
                         response, status_code = response
+                elif len(parts) == 7 and parts[5] == "Bios" and parts[6] == "SD":  # /Bios/SD pending
+                    vm_id = int(parts[4])
+                    response = get_bios_sd(proxmox, vm_id)
+                    if isinstance(response, tuple):
+                        response, status_code = response
                 # END NEW CODE
+                elif len(parts) == 6 and parts[5] == "BootOptions":  # /redfish/v1/Systems/<vm_id>/BootOptions
+                    vm_id = int(parts[4])
+                    response = get_boot_options_collection(proxmox, vm_id)
+                    if isinstance(response, tuple):
+                        response, status_code = response
+                elif len(parts) == 7 and parts[5] == "BootOptions":  # /redfish/v1/Systems/<vm_id>/BootOptions/<ref>
+                    vm_id = int(parts[4])
+                    option_ref = parts[6]
+                    response = get_boot_option_detail(proxmox, vm_id, option_ref)
+                    if isinstance(response, tuple):
+                        response, status_code = response
                 elif len(parts) == 6 and parts[5] == "Processors":  # /redfish/v1/Systems/<vm_id>/Processors
                     vm_id = int(parts[4])
                     response = get_processor_collection(proxmox, vm_id)
@@ -1179,6 +1568,18 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     response = get_ethernet_interface_detail(proxmox, vm_id, interface_id)
                     if isinstance(response, tuple):
                         response, status_code = response
+                else:
+                    status_code = 404
+                    response = {"error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Resource not found: {path}"}}
+            elif path == "/redfish/v1/Managers":
+                response = get_managers_collection()
+            elif path.startswith("/redfish/v1/Managers/"):
+                if len(parts) == 5:  # /redfish/v1/Managers/<id>
+                    response = get_manager(parts[4])
+                elif len(parts) == 6 and parts[5] == "NetworkProtocol":
+                    response = get_manager_network_protocol(parts[4])
+                elif len(parts) == 7 and parts[5] == "HostInterfaces" and parts[6] == "Self":
+                    response = get_host_interface_self(parts[4])
                 else:
                     status_code = 404
                     response = {"error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Resource not found: {path}"}}
@@ -1314,6 +1715,22 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                         vm_id = path.split("/")[4]
                         config_data = data
                         response, status_code = update_vm_config(proxmox, int(vm_id), config_data)
+                    elif "/Bios/Actions/Bios.ChangePassword" in path:
+                        # AMI change_uefi_password() -> POST {PasswordName,OldPassword,NewPassword}.
+                        # Stubbed success (no real UEFI password on a VM).
+                        status_code = 200
+                        response = {"@odata.type": "#Message.v1_1_0.Message",
+                                    "Message": "UEFI/BIOS password updated"}
+                    elif "/Bios/Actions/Bios.ResetBios" in path:
+                        vm_id = path.split("/")[4]
+                        bios_state(vm_id).clear()
+                        bios_state(vm_id).update(_AMI_BIOS_SEED)
+                        status_code = 200
+                        response = {"@odata.type": "#Message.v1_1_0.Message",
+                                    "Message": f"BIOS reset for VM {vm_id}"}
+                    elif "/Actions/Manager.Reset" in path:
+                        status_code = 200
+                        response = {"@odata.type": "#Message.v1_1_0.Message", "Message": "Manager reset"}
                     else:
                         status_code = 404
                         response = {"error": {"code": "Base.1.0.GeneralError", "message": f"Resource not found: {path}"}}
@@ -1351,7 +1768,7 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
         headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
         logger.debug(f"PATCH Request: path={self.path}\nHeaders:\n{headers_str}\nPayload:\n{json.dumps(payload, indent=2)}")
 
-        path = self.path.rstrip("/")
+        path = self.path.split("?", 1)[0].rstrip("/")
         parts = path.split("/")
         response = {}
         status_code = 200
@@ -1382,7 +1799,84 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                 logger.debug(f"PATCH Response: path={self.path}, status={status_code}, body={json.dumps(response)}")
                 return
             
-            if len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
+            if len(parts) == 6 and parts[5] == "SD":  # /redfish/v1/Systems/<vm_id>/SD  (AMI @Redfish.Settings)
+                # NICo's AMI change_boot_order() PATCHes the Settings resource
+                # with {"Boot": {"BootOrder": [refs...]}} and If-Match: *, and
+                # expects 204 No Content. We translate the reference order back
+                # into Proxmox `boot: order=...`.
+                vm_id = parts[4]
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    boot = data.get("Boot", {})
+                    if "BootOrder" not in boot:
+                        status_code = 400
+                        response = {"error": {"code": "Base.1.0.InvalidRequest",
+                                              "message": "Boot.BootOrder required in PATCH to Settings resource"}}
+                    else:
+                        proxmox_boot = boot_order_to_proxmox(boot["BootOrder"])
+                        logger.debug(f"VM {vm_id}: applying BootOrder {boot['BootOrder']} -> '{proxmox_boot}'")
+                        proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.set(boot=proxmox_boot)
+                        # AMI patch_with_if_match expects 204 No Content (no body).
+                        self.send_response(204)
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        logger.debug(f"PATCH Response: path={self.path}, status=204 (BootOrder applied)")
+                        return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+                except Exception as e:
+                    response, status_code = handle_proxmox_error("Set BootOrder", e, vm_id)
+            elif len(parts) == 7 and parts[5] == "Bios" and parts[6] == "SD":  # /Systems/<vm_id>/Bios/SD
+                # AMI set_bios() / change_bios_password() PATCH pending attributes
+                # here with If-Match: * and expect 204. We merge immediately.
+                vm_id = parts[4]
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    attributes = data.get("Attributes", {})
+                    if not isinstance(attributes, dict):
+                        status_code = 400
+                        response = {"error": {"code": "Base.1.0.InvalidRequest", "message": "Attributes object required"}}
+                    else:
+                        patch_bios_attributes(vm_id, attributes)
+                        logger.debug(f"VM {vm_id}: merged BIOS pending attrs {list(attributes)}")
+                        self.send_response(204)
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        logger.debug(f"PATCH Response: path={self.path}, status=204 (Bios/SD merged)")
+                        return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+            elif path.startswith("/redfish/v1/Managers/") and len(parts) == 6 and parts[5] == "NetworkProtocol":
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    ipmi = data.get("IPMI", {})
+                    if "ProtocolEnabled" in ipmi:
+                        _MGR_STATE["ipmi_enabled"] = bool(ipmi["ProtocolEnabled"])
+                    self.send_response(204)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    logger.debug(f"PATCH Response: path={self.path}, status=204 (ipmi={_MGR_STATE['ipmi_enabled']})")
+                    return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+            elif path.startswith("/redfish/v1/Managers/") and len(parts) == 7 \
+                    and parts[5] == "HostInterfaces" and parts[6] == "Self":
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    if "InterfaceEnabled" in data:
+                        _MGR_STATE["host_iface_enabled"] = bool(data["InterfaceEnabled"])
+                    self.send_response(204)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    logger.debug(f"PATCH Response: path={self.path}, status=204 (host_iface={_MGR_STATE['host_iface_enabled']})")
+                    return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+            elif len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
                 vm_id = parts[4]
                 try:
                     data = json.loads(post_data.decode('utf-8'))
@@ -1432,6 +1926,43 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                     response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
                 except Exception as e:
                     response, status_code = handle_proxmox_error("BIOS update", e, vm_id)
+            elif (path.startswith("/redfish/v1/Systems/") and len(parts) == 5
+                  and self.headers.get("If-Match") is not None):
+                # AMI set_boot_override() / boot_once(): one-shot (or persistent)
+                # Boot override via PATCH /Systems/{id} with If-Match: *, body
+                # {"Boot":{"BootSourceOverrideTarget":..,"BootSourceOverrideEnabled":..}}.
+                # Expects 204. (The non-If-Match path below keeps sushy's 202+task.)
+                # Proxmox has no true one-shot UEFI boot, so we apply a best-effort
+                # persistent reorder; NICo sets explicit boot order separately.
+                vm_id = parts[4]
+                try:
+                    data = json.loads(post_data.decode("utf-8"))
+                    boot = data.get("Boot", {})
+                    target = boot.get("BootSourceOverrideTarget")
+                    enabled = boot.get("BootSourceOverrideEnabled", "Once")
+                    config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+                    macs = dpu_hostpci_macs(int(vm_id), config)
+                    dev = pick_boot_device_for_target(config, macs, target)
+                    if enabled == "Disabled":
+                        logger.debug(f"VM {vm_id}: boot override disabled (no-op)")
+                    elif dev:
+                        order = current_boot_order(config, macs)
+                        new_order = [dev] + [r for r in order if r != dev]
+                        proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.set(
+                            boot=boot_order_to_proxmox(new_order))
+                        logger.debug(f"VM {vm_id}: boot override {target} ({enabled}) -> {dev} first")
+                    else:
+                        logger.warning(f"VM {vm_id}: no device for boot override target {target}; acknowledging")
+                    self.send_response(204)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    logger.debug(f"PATCH Response: path={self.path}, status=204 (boot override)")
+                    return
+                except json.JSONDecodeError:
+                    status_code = 400
+                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
+                except Exception as e:
+                    response, status_code = handle_proxmox_error("Boot override", e, vm_id)
             elif path.startswith("/redfish/v1/Systems/") and len(parts) == 5:
                 vm_id = path.split("/")[4]
                 logger.debug(f"Processing boot configuration for VM {vm_id}")
